@@ -24,8 +24,8 @@ registry = dict(basic={}, extended={})
 class PostgresqlCollector(diamond.collector.Collector):
 
     def get_default_config_help(self):
-        config_help = super(PostgresqlCollector, self).get_default_config_help()
-        config_help.update({
+        conf_help = super(PostgresqlCollector, self).get_default_config_help()
+        conf_help.update({
             'host': 'Hostname',
             'user': 'Username',
             'password': 'Password',
@@ -33,7 +33,7 @@ class PostgresqlCollector(diamond.collector.Collector):
             'underscore': 'Convert _ to .',
             'extended': 'Enable collection of extended database stats',
         })
-        return config_help
+        return conf_help
 
     def get_default_config(self):
         """
@@ -205,7 +205,8 @@ class QueryStats(object):
                             continue
 
                         self.data.append({
-                            'datname': self._translate_datname(row.get('datname', db)),
+                            'datname': self._translate_datname(
+                                row.get('datname', db)),
                             'schemaname': row.get('schemaname', None),
                             'relname': row.get('relname', None),
                             'indexrelname': row.get('indexrelname', None),
@@ -474,8 +475,9 @@ class IdleInTransactions(QueryStats):
 
         return """
             SELECT 'idle_in_transaction',
-                   max(COALESCE(ROUND(EXTRACT(epoch FROM now()-query_start)),0))
-                       AS idle_in_transaction
+                   max(
+                       COALESCE(ROUND(EXTRACT(epoch FROM now()-query_start)),0)
+                   ) AS idle_in_transaction
             FROM pg_stat_activity
             WHERE %s
             GROUP BY 1
@@ -496,12 +498,16 @@ class LongestRunningQueries(QueryStats):
 
         return """
             SELECT 'query',
-                COALESCE(max(extract(epoch FROM CURRENT_TIMESTAMP-query_start)),0)
+                COALESCE(
+                    max(extract(epoch FROM CURRENT_TIMESTAMP-query_start)), 0
+                )
             FROM pg_stat_activity
             WHERE %s
             UNION ALL
             SELECT 'transaction',
-                COALESCE(max(extract(epoch FROM CURRENT_TIMESTAMP-xact_start)),0)
+                COALESCE(
+                    max(extract(epoch FROM CURRENT_TIMESTAMP-xact_start)), 0
+                )
             FROM pg_stat_activity
             WHERE 1=1
         """ % where
