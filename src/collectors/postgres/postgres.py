@@ -57,6 +57,12 @@ class PostgresqlCollector(diamond.collector.Collector):
             self.log.error('Unable to import module psycopg2')
             return {}
 
+        # Get database version
+        db_version = self._get_db_version()
+        if not db_version:
+            self.log.error('Unable to get database version')
+            return {}
+
         # Create database-specific connections
         self.connections = {}
         for db in self._get_db_names():
@@ -68,8 +74,10 @@ class PostgresqlCollector(diamond.collector.Collector):
             metrics = registry['basic']
 
         # Iterate every QueryStats class
+        underscore = self.config['underscore']
         for klass in metrics.itervalues():
-            stat = klass(self.connections, underscore=self.config['underscore'])
+            stat = klass(self.connections, underscore=underscore,
+                         db_version=db_version)
             stat.fetch()
             [self.publish(metric, value) for metric, value in stat]
 
@@ -100,6 +108,25 @@ class PostgresqlCollector(diamond.collector.Collector):
             datnames = ['postgres']
         return datnames
 
+    def _get_db_version(self):
+        query = """
+            SELECT version()
+        """
+        conn = self._connect()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute(query)
+        rows = [d['version'] for d in cursor.fetchall()]
+        conn.close()
+
+        try:
+            # Version is second word in long-lond string like
+            # "PostgreSQL 9.2.2 on x86_64-apple-darwin12.2.0, compiled by ..."
+            db_version = [int(v) for v in rows[0].split(' ')[1].split('.')]
+        except IndexError:
+            return  # can't split string
+
+        return db_version
+
     def _connect(self, database='postgres'):
         conn = psycopg2.connect(
             host=self.config['host'],
@@ -124,15 +151,34 @@ def extended(cls):
 
 
 class QueryStats(object):
-    def __init__(self, conns, parameters=None, underscore=False):
+    def __init__(self, conns, parameters=None, underscore=False,
+                 db_version=None):
         self.connections = conns
         self.underscore = underscore
         self.parameters = parameters
+        self.db_version = db_version
 
     def _translate_datname(self, db):
         if self.underscore:
             db = db.replace("_", ".")
         return db
+
+    def _is_new_pg_stat_activity(self):
+        """
+        In PostgreSQL >= 9.2 `pg_stat_activity` table has new format.
+        Column `procpid` has been renamed to `pid`.
+        Column `current_query` disappears and is replaced by two columns:
+        - state: is the session running a query, waiting
+        - query: what is the last run (or still running
+                 if stat is "active") query
+        We need to check PostgreSQL version to use this columns in this table.
+        """
+        # May be we need to add some real version comparsion here
+        if self.db_version[0] < 9:
+            return False
+        if self.db_version[0] == 9 and self.db_version[1] < 2:
+            return False
+        return True
 
     def fetch(self):
         self.data = list()
@@ -281,34 +327,64 @@ class UserIndexIOStats(QueryStats):
 class ConnectionStateStats(QueryStats):
     path = "%(datname)s.connections.%(metric)s"
     multi_db = True
-    query = """
-        SELECT tmp.state AS key,COALESCE(count,0) FROM
-               (VALUES ('active'),
-                       ('waiting'),
-                       ('idle'),
-                       ('idletransaction'),
-                       ('unknown')
-                ) AS tmp(state)
-        LEFT JOIN
-             (SELECT CASE WHEN waiting THEN 'waiting'
-                          WHEN current_query='<IDLE>' THEN 'idle'
-                          WHEN current_query='<IDLE> in transaction'
-                              THEN 'idletransaction'
-                          WHEN current_query='<insufficient privilege>'
-                              THEN 'unknown'
-                          ELSE 'active' END AS state,
-                     count(*) AS count
-               FROM pg_stat_activity
-               WHERE procpid != pg_backend_pid()
-               GROUP BY CASE WHEN waiting THEN 'waiting'
-                             WHEN current_query='<IDLE>' THEN 'idle'
-                             WHEN current_query='<IDLE> in transaction'
-                                 THEN 'idletransaction'
-                             WHEN current_query='<insufficient privilege>'
-                                 THEN 'unknown' ELSE 'active' END
-             ) AS tmp2
-        ON tmp.state=tmp2.state ORDER BY 1
-    """
+
+    @property
+    def query(self):
+        if self._is_new_pg_stat_activity():
+            pid_column = 'pid'
+            metrics = """
+                ('active'),
+                ('waiting'),
+                ('idle'),
+                ('idletransaction'),
+                ('idletransactionaborted'),
+                ('fastpathfunctioncall'),
+                ('disabled'),
+                ('unknown')
+            """
+            state_case = """
+                CASE WHEN waiting THEN 'waiting'
+                     WHEN state='active' THEN 'active'
+                     WHEN state='idle' THEN 'idle'
+                     WHEN state='idle in transaction' THEN 'idletransaction'
+                     WHEN state='idle in transaction (aborted)'
+                         THEN 'idletransactionaborted'
+                     WHEN state='fastpath function call'
+                         THEN 'fastpathfunctioncall'
+                     WHEN state='disabled' THEN 'disabled'
+                     ELSE 'unknown' END
+            """
+        else:
+            pid_column = 'procpid'
+            metrics = """
+                ('active'),
+                ('waiting'),
+                ('idle'),
+                ('idletransaction'),
+                ('unknown')
+            """
+            state_case = """
+                CASE WHEN waiting THEN 'waiting'
+                     WHEN current_query='<IDLE>' THEN 'idle'
+                     WHEN current_query='<IDLE> in transaction'
+                         THEN 'idletransaction'
+                     WHEN current_query='<insufficient privilege>'
+                         THEN 'unknown'
+                     ELSE 'active' END
+            """
+
+        return """
+            SELECT tmp.state AS key,COALESCE(count,0) FROM
+                   (VALUES %s) AS tmp(state)
+            LEFT JOIN
+                 (SELECT %s AS state,
+                         count(*) AS count
+                   FROM pg_stat_activity
+                   WHERE %s != pg_backend_pid()
+                   GROUP BY %s
+                 ) AS tmp2
+            ON tmp.state=tmp2.state ORDER BY 1
+        """ % (metrics, state_case, pid_column, state_case)
 
 
 @extended
@@ -388,45 +464,69 @@ class TransactionCount(QueryStats):
 class IdleInTransactions(QueryStats):
     path = "%(datname)s.longest_running.%(metric)s"
     multi_db = True
-    query = """
-        SELECT 'idle_in_transaction',
-               max(COALESCE(ROUND(EXTRACT(epoch FROM now()-query_start)),0))
-                   AS idle_in_transaction
-        FROM pg_stat_activity
-        WHERE current_query = '<IDLE> in transaction'
-        GROUP BY 1
-    """
+
+    @property
+    def query(self):
+        if self._is_new_pg_stat_activity():
+            where = "state = 'idle in transaction'"
+        else:
+            where = "current_query = '<IDLE> in transaction'"
+
+        return """
+            SELECT 'idle_in_transaction',
+                   max(COALESCE(ROUND(EXTRACT(epoch FROM now()-query_start)),0))
+                       AS idle_in_transaction
+            FROM pg_stat_activity
+            WHERE %s
+            GROUP BY 1
+        """ % where
 
 
 @extended
 class LongestRunningQueries(QueryStats):
     path = "%(datname)s.longest_running.%(metric)s"
     multi_db = True
-    query = """
-        SELECT 'query',
-            COALESCE(max(extract(epoch FROM CURRENT_TIMESTAMP-query_start)),0)
-        FROM pg_stat_activity
-        WHERE current_query NOT LIKE '<IDLE%'
-        UNION ALL
-        SELECT 'transaction',
-            COALESCE(max(extract(epoch FROM CURRENT_TIMESTAMP-xact_start)),0)
-        FROM pg_stat_activity
-        WHERE 1=1
-    """
+
+    @property
+    def query(self):
+        if self._is_new_pg_stat_activity():
+            where = "state NOT LIKE 'idle%'"
+        else:
+            where = "current_query NOT LIKE '<IDLE%'"
+
+        return """
+            SELECT 'query',
+                COALESCE(max(extract(epoch FROM CURRENT_TIMESTAMP-query_start)),0)
+            FROM pg_stat_activity
+            WHERE %s
+            UNION ALL
+            SELECT 'transaction',
+                COALESCE(max(extract(epoch FROM CURRENT_TIMESTAMP-xact_start)),0)
+            FROM pg_stat_activity
+            WHERE 1=1
+        """ % where
 
 
 @extended
 class UserConnectionCount(QueryStats):
     path = "%(datname)s.user_connections.%(metric)s"
     multi_db = True
-    query = """
-        SELECT usename,
-               count(*) as count
-        FROM pg_stat_activity
-        WHERE procpid != pg_backend_pid()
-        GROUP BY usename
-        ORDER BY 1
-    """
+
+    @property
+    def query(self):
+        if self._is_new_pg_stat_activity():
+            pid_column = 'pid'
+        else:
+            pid_column = 'procpid'
+
+        return """
+            SELECT usename,
+                   count(*) as count
+            FROM pg_stat_activity
+            WHERE %s != pg_backend_pid()
+            GROUP BY usename
+            ORDER BY 1
+        """ % pid_column
 
 
 @basic
